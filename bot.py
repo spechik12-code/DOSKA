@@ -28,11 +28,11 @@ data = {"chats": {}}
 # Fallback курсы
 FALLBACK_LARI_TO_USD = 0.37
 FALLBACK_EURO_TO_USD = 1.05
-FALLBACK_AMD_TO_USD = 0.0025  # Армянский драм
+FALLBACK_AMD_TO_USD = 0.0025
 
 current_lari_to_usd = FALLBACK_LARI_TO_USD
 current_euro_to_usd = FALLBACK_EURO_TO_USD
-current_amd_to_usd = FALLBACK_AMD_TO_USD  # Армянский драм
+current_amd_to_usd = FALLBACK_AMD_TO_USD
 
 
 def update_exchange_rates():
@@ -43,7 +43,7 @@ def update_exchange_rates():
             rates = response.json()["rates"]
             current_lari_to_usd = 1 / rates.get("GEL", 1 / FALLBACK_LARI_TO_USD)
             current_euro_to_usd = rates.get("EUR", FALLBACK_EURO_TO_USD)
-            current_amd_to_usd = 1 / rates.get("AMD", 1 / FALLBACK_AMD_TO_USD)  # Армянский драм
+            current_amd_to_usd = 1 / rates.get("AMD", 1 / FALLBACK_AMD_TO_USD)
     except:
         pass
 
@@ -234,179 +234,180 @@ async def add_booking(m: types.Message, state: FSMContext):
 
     chat_str = str(m.chat.id)
     await ensure_chat(m.chat.id)
+    bid = data["chats"][chat_str]["next_id"]
+    data["chats"][chat_str]["next_id"] += 1
 
     booking = {
-        "time": time_part,
-        "info": info,
-        "duration": pretty,
-        "duration_sec": sec,
-        "original_text": text,
-        "id": data["chats"][chat_str]["next_id"],
-        "msg_id": m.message_id
+        "id": bid, "time": time_part, "info": info, "duration": pretty, "duration_sec": sec,
+        "author_id": m.from_user.id, "done": False, "cancelled": False, "deleted": False,
+        "reply_msg_id": None,
+        "original_text": text.strip(),
     }
-    data["chats"][chat_str]["next_id"] += 1
     data["chats"][chat_str]["bookings"].append(booking)
     save_data()
 
+    sorted_b = sorted(data["chats"][chat_str]["bookings"], key=lambda x: time_key(x["time"]))
+    pos = next((i + 1 for i, b in enumerate(sorted_b) if b["id"] == bid), 0)
+
+    reply = await m.reply(f"Добавлено!\n{pos}. {time_part} — {info} ({pretty})", reply_markup=personal_kb(bid))
+    booking["reply_msg_id"] = reply.message_id
+    save_data()
     await refresh_board(m.chat.id)
 
-    kb = personal_kb(booking["id"])
-    await m.reply(
-        f"Бронь добавлена:\n{booking['time']} — {booking['info']} ({booking['duration']})",
-        reply_markup=kb
+
+# ==================== ДЕЙСТВИЯ ====================
+@dp.callback_query(F.data.startswith(("done:", "cancel:", "delete:")))
+async def actions(c: types.CallbackQuery):
+    await c.answer()
+    action, payload = c.data.split(":", 1)
+    bid = int(payload)
+    chat_id = c.message.chat.id
+    chat_str = str(chat_id)
+    await ensure_chat(chat_id)
+    idx = find_booking_index(chat_str, bid)
+    if idx is None:
+        await c.answer("Бронь не найдена.", show_alert=True)
+        return
+    b = data["chats"][chat_str]["bookings"][idx]
+    if c.from_user.id not in (b["author_id"], *OWNERS):
+        await c.answer("Это не твоя бронь!", show_alert=True)
+        return
+
+    if action == "done":
+        if not b.get("done"):
+            b["done"] = True
+            b["cancelled"] = False
+            asyncio.create_task(booking_timer(chat_id, bid))
+            await c.answer("Клиент пришёл — таймер запущен!", show_alert=True)
+    elif action == "cancel":
+        b["cancelled"] = True
+        b["done"] = False
+    elif action == "delete":
+        b["deleted"] = True
+
+    save_data()
+    await refresh_board(chat_id)
+    if b.get("reply_msg_id"):
+        try:
+            await bot.edit_message_reply_markup(chat_id, b["reply_msg_id"], reply_markup=personal_kb(bid, b.get("done"), b.get("cancelled"), b.get("deleted")))
+        except:
+            b["reply_msg_id"] = None
+            save_data()
+
+
+# ==================== РЕДАКТИРОВАНИЕ ====================
+@dp.callback_query(F.data.startswith("edit:"))
+async def start_edit(c: types.CallbackQuery, state: FSMContext):
+    await c.answer()
+    bid = int(c.data.split(":", 1)[1])
+    chat_str = str(c.message.chat.id)
+    await ensure_chat(c.message.chat.id)
+    idx = find_booking_index(chat_str, bid)
+    if idx is None:
+        await c.answer("Бронь не найдена.", show_alert=True)
+        return
+    b = data["chats"][chat_str]["bookings"][idx]
+    if c.from_user.id not in (b["author_id"], *OWNERS):
+        await c.answer("Это не твоя бронь! Редактировать нельзя.", show_alert=True)
+        return
+
+    await state.update_data(edit_bid=bid, reply_msg_id=b.get("reply_msg_id"))
+    await state.set_state(EditState.waiting_for_new_text)
+
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Отменить редактирование", callback_data="cancel_edit")]
+    ])
+
+    await c.message.reply(
+        "<b>Редактируй бронь:</b>\n\n"
+        f"<b>Текущая:</b> <code>{b['time']} {b['info']} {b['duration']}</code>\n\n"
+        "<b>Пиши в формате:</b>\n"
+        "<code>18:30 Анна 1ч 30мин</code>\n"
+        "<code>15:00 Иван 300 лари</code>\n\n"
+        "<i>или нажми кнопку ниже</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_kb
     )
 
 
-# ==================== CALLBACK КНОПКИ ====================
-@dp.callback_query(F.data.startswith("done:"))
-async def cb_done(cb: types.CallbackQuery):
-    if cb.message.chat.id not in ALLOWED_CHATS:
-        return await cb.answer("Недоступно")
-
-    bid = int(cb.data.split(":")[1])
-    chat_str = str(cb.message.chat.id)
-    idx = find_booking_index(chat_str, bid)
-    if idx is None:
-        return await cb.answer("Бронь не найдена")
-
-    b = data["chats"][chat_str]["bookings"][idx]
-    if b.get("deleted"):
-        return await cb.answer("Бронь удалена")
-
-    b["done"] = True
-    b["cancelled"] = False
-    save_data()
-
-    kb = personal_kb(bid, done=True, cancelled=False)
-    try:
-        await cb.message.edit_reply_markup(reply_markup=kb)
-    except:
-        pass
-
-    await refresh_board(cb.message.chat.id)
-    asyncio.create_task(booking_timer(cb.message.chat.id, bid))
-    await cb.answer("Клиент пришёл, таймер запущен!")
-
-
-@dp.callback_query(F.data.startswith("cancel:"))
-async def cb_cancel(cb: types.CallbackQuery):
-    if cb.message.chat.id not in ALLOWED_CHATS:
-        return await cb.answer("Недоступно")
-
-    bid = int(cb.data.split(":")[1])
-    chat_str = str(cb.message.chat.id)
-    idx = find_booking_index(chat_str, bid)
-    if idx is None:
-        return await cb.answer("Бронь не найдена")
-
-    b = data["chats"][chat_str]["bookings"][idx]
-    if b.get("deleted"):
-        return await cb.answer("Бронь удалена")
-
-    b["cancelled"] = True
-    b["done"] = False
-    save_data()
-
-    kb = personal_kb(bid, done=False, cancelled=True)
-    try:
-        await cb.message.edit_reply_markup(reply_markup=kb)
-    except:
-        pass
-
-    await refresh_board(cb.message.chat.id)
-    await cb.answer("Отмечено: клиент не пришёл")
-
-
-@dp.callback_query(F.data.startswith("delete:"))
-async def cb_delete(cb: types.CallbackQuery):
-    if cb.message.chat.id not in ALLOWED_CHATS:
-        return await cb.answer("Недоступно")
-
-    bid = int(cb.data.split(":")[1])
-    chat_str = str(cb.message.chat.id)
-    idx = find_booking_index(chat_str, bid)
-    if idx is None:
-        return await cb.answer("Бронь не найдена")
-
-    b = data["chats"][chat_str]["bookings"][idx]
-    b["deleted"] = True
-    b["done"] = False
-    b["cancelled"] = False
-    save_data()
-
-    kb = personal_kb(bid, deleted=True)
-    try:
-        await cb.message.edit_reply_markup(reply_markup=kb)
-    except:
-        pass
-
-    await refresh_board(cb.message.chat.id)
-    await cb.answer("Бронь удалена")
-
-
-@dp.callback_query(F.data.startswith("edit:"))
-async def cb_edit(cb: types.CallbackQuery, state: FSMContext):
-    if cb.message.chat.id not in ALLOWED_CHATS:
-        return await cb.answer("Недоступно")
-
-    bid = int(cb.data.split(":")[1])
-    chat_str = str(cb.message.chat.id)
-    idx = find_booking_index(chat_str, bid)
-    if idx is None:
-        return await cb.answer("Бронь не найдена")
-
-    b = data["chats"][chat_str]["bookings"][idx]
-    if b.get("deleted"):
-        return await cb.answer("Бронь удалена")
-
-    await state.set_state(EditState.waiting_for_new_text)
-    await state.update_data(booking_id=bid)
-    await cb.message.answer("Отправь новый текст брони в формате:\nВремя Имя [продолжительность]")
-    await cb.answer()
+@dp.callback_query(F.data == "cancel_edit")
+async def cancel_edit_callback(c: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.answer("Редактирование отменено", show_alert=True)
+    await c.message.edit_text("Редактирование отменено.")
 
 
 @dp.message(StateFilter(EditState.waiting_for_new_text))
-async def process_edit(m: types.Message, state: FSMContext):
-    if m.chat.id not in ALLOWED_CHATS:
-        return
-
-    data_state = await state.get_data()
-    bid = data_state.get("booking_id")
-    if bid is None:
-        await state.clear()
-        return
-
+async def apply_edit(m: types.Message, state: FSMContext):
+    user_data = await state.get_data()
+    bid = user_data.get("edit_bid")
     chat_str = str(m.chat.id)
+    await ensure_chat(m.chat.id)
     idx = find_booking_index(chat_str, bid)
     if idx is None:
-        await m.reply("Бронь не найдена")
+        await m.reply("Бронь уже удалена.")
+        await state.clear()
+        return
+    b = data["chats"][chat_str]["bookings"][idx]
+    if m.from_user.id not in (b["author_id"], *OWNERS):
+        await m.reply("Это не твоя бронь!")
         await state.clear()
         return
 
-    text = m.text.strip()
-    if not re.match(r"^\d{1,2}:\d{2}", text):
-        await m.reply("Неверный формат. Попробуй ещё раз или отправь /cancel")
+    new_text = m.text.strip()
+    if not re.match(r"^\d{1,2}:\d{2}", new_text):
+        await m.reply("Начни с времени: 17:30 ...")
         return
 
-    time_part = text.split(maxsplit=1)[0]
-    rest = text[len(time_part):].strip()
+    time_part = new_text.split(maxsplit=1)[0]
+    rest = new_text[len(time_part):].strip()
     sec, pretty = parse_duration(rest)
     info = re.sub(r"\d+\s*(ч|час|мин|минут|м)\b.*$", "", rest, flags=re.I).strip() or "Без имени"
 
-    b = data["chats"][chat_str]["bookings"][idx]
-    b["time"] = time_part
-    b["info"] = info
-    b["duration"] = pretty
-    b["duration_sec"] = sec
-    b["original_text"] = text
+    b.update({"time": time_part, "info": info, "duration": pretty, "duration_sec": sec,
+              "original_text": new_text,
+              "done": False, "cancelled": False, "deleted": False})
     save_data()
 
+    sorted_b = sorted(data["chats"][chat_str]["bookings"], key=lambda x: time_key(x["time"]))
+    pos = next((i + 1 for i, bb in enumerate(sorted_b) if bb["id"] == bid), 0)
+    reply_text = f"Обновлено!\n{pos}. {time_part} — {info} ({pretty})"
+
+    if b.get("reply_msg_id"):
+        try:
+            await bot.edit_message_text(chat_id=m.chat.id, message_id=b["reply_msg_id"],
+                                        text=reply_text, reply_markup=personal_kb(bid))
+        except:
+            r = await m.reply(reply_text, reply_markup=personal_kb(bid))
+            b["reply_msg_id"] = r.message_id
+    else:
+        r = await m.reply(reply_text, reply_markup=personal_kb(bid))
+        b["reply_msg_id"] = r.message_id
+
+    save_data()
+    await m.reply("Бронь обновлена!")
+
+    try:
+        await m.reply_to_message.delete()
+    except:
+        pass
+
     await refresh_board(m.chat.id)
-    await m.reply(f"Бронь обновлена:\n{b['time']} — {b['info']} ({b['duration']})")
     await state.clear()
 
 
-# ==================== ДОБАВЛЕНИЕ РАСХОДА ====================
+# ==================== /cancel ====================
+@dp.message(Command("cancel"))
+async def cmd_cancel(m: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state:
+        await state.clear()
+        await m.reply("Редактирование отменено.")
+    else:
+        await m.reply("Нечего отменять.")
+
+
+# ==================== КОМАНДА /expense — ТОЛЬКО ДЛЯ ВЛАДЕЛЬЦЕВ ====================
 @dp.message(Command("expense"))
 async def cmd_expense(m: types.Message):
     if m.from_user.id not in OWNERS:
@@ -415,12 +416,12 @@ async def cmd_expense(m: types.Message):
 
     text = m.text[len("/expense"):].strip()
     if not text:
-        await m.reply("Формат: /expense тип сумма [комментарий]\nПример: /expense Расходники 50 оплата за аренду")
+        await m.reply("Использование: /expense <тип> <сумма> [комментарий]\nПример: /expense квартира 500")
         return
 
     parts = text.split(maxsplit=2)
     if len(parts) < 2:
-        await m.reply("Не хватает данных. Нужно минимум тип и сумма")
+        await m.reply("Укажи тип и сумму\nПример: /expense билет 200")
         return
 
     exp_type = parts[0].capitalize()
