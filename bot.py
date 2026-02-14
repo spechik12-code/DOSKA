@@ -1060,6 +1060,170 @@ def generate_period_report(date_from: datetime, date_to: datetime) -> str:
     return text
 
 
+def generate_girl_report(date_from: datetime, date_to: datetime, chat_id_filter: str) -> str:
+    """Отчёт по кассе девочки (чату) в формате: день -> список броней -> итоги в gel."""
+    update_exchange_rates()
+
+    # gel за 1 доллар (обратный курс)
+    usd_to_gel = 1 / current_lari_to_usd if current_lari_to_usd > 0 else 2.70
+    euro_to_gel = current_euro_to_usd * usd_to_gel
+
+    shifts = get_shifts_for_period(date_from, date_to)
+    # Фильтруем по нужному чату
+    shifts = [s for s in shifts if str(s.get("chat_id", "")) == str(chat_id_filter)]
+
+    if not shifts:
+        return "Нет данных за этот период."
+
+    chat_title = shifts[0].get("chat_title", "Неизвестно") if shifts else "Неизвестно"
+    girl_name = extract_girl_name(chat_title)
+    period_str = f"{date_from.strftime('%d.%m')} — {date_to.strftime('%d.%m.%Y')}"
+
+    # Группируем по дате
+    by_date = {}
+    for shift in shifts:
+        date_str = shift.get("date", "")
+        if date_str not in by_date:
+            by_date[date_str] = []
+        came = [b for b in shift.get("bookings", []) if b.get("done") and not b.get("deleted")]
+        by_date[date_str].extend(came)
+
+    # Генерируем все дни
+    text = f"<b>{girl_name}</b>\n"
+    text += f"<i>{chat_title}</i>\n"
+    text += f"<i>{period_str}</i>\n\n"
+
+    totals = {"лари": 0, "$": 0, "евро": 0, "крипта": 0, "драм": 0}
+
+    current = date_from
+    while current <= date_to:
+        d_str = current.strftime("%d.%m")
+        d_full = current.strftime("%d.%m.%Y")
+
+        # Ищем смену за эту дату
+        bookings = by_date.get(d_full, [])
+
+        text += f"<b>{d_str}</b>\n"
+        if not bookings:
+            text += "0\n"
+        else:
+            for b in sorted(bookings, key=lambda x: time_key(x.get("time", "00:00"))):
+                _, currencies = extract_booking_usd(b)
+                op_name = extract_operator_name(b)
+                duration = b.get("duration", "")
+
+                # Форматируем сумму
+                parts = []
+                for cur_name, amt in currencies.items():
+                    if amt > 0:
+                        if cur_name == "лари":
+                            parts.append(f"{amt}")
+                        elif cur_name == "$":
+                            parts.append(f"{amt}$")
+                        elif cur_name == "евро":
+                            parts.append(f"{amt}€")
+                        elif cur_name == "крипта":
+                            parts.append(f"{amt} USDT")
+                        elif cur_name == "драм":
+                            parts.append(f"{amt} драм")
+                amount_str = " + ".join(parts) if parts else "0"
+
+                text += f"  {amount_str}/2 {op_name}\n"
+
+                for cur_name, amt in currencies.items():
+                    totals[cur_name] = totals.get(cur_name, 0) + amt
+
+        current += timedelta(days=1)
+
+    # ===== РАСЧЁТ =====
+    text += "\n<b>Расчёт:</b>\n"
+
+    total_gel = 0
+
+    # Лари
+    if totals["лари"] > 0:
+        half = totals["лари"] / 2
+        text += f"\n<b>Лари:</b> {totals['лари']:.0f} gel\n"
+        text += f"  {totals['лари']:.0f} / 2 = {half:.0f} gel\n"
+        total_gel += half
+
+    # USD
+    if totals["$"] > 0:
+        half = totals["$"] / 2
+        gel_val = half * usd_to_gel
+        text += f"\n<b>USD:</b> {totals['$']:.0f}$\n"
+        text += f"  {totals['$']:.0f} / 2 = {half:.0f}$\n"
+        text += f"  {half:.0f} × {usd_to_gel:.2f} = {gel_val:.2f} gel\n"
+        total_gel += gel_val
+
+    # Евро
+    if totals["евро"] > 0:
+        half = totals["евро"] / 2
+        usd_val = half * current_euro_to_usd
+        gel_val = usd_val * usd_to_gel
+        text += f"\n<b>Евро:</b> {totals['евро']:.0f}€\n"
+        text += f"  {totals['евро']:.0f} / 2 = {half:.0f}€\n"
+        text += f"  {half:.0f} × {current_euro_to_usd:.2f} = {usd_val:.2f}$\n"
+        text += f"  {usd_val:.2f} × {usd_to_gel:.2f} = {gel_val:.2f} gel\n"
+        total_gel += gel_val
+
+    # Крипта
+    crypto_gel = 0
+    if totals["крипта"] > 0:
+        half = totals["крипта"] / 2
+        gel_val = half * usd_to_gel
+        text += f"\n<b>Крипта:</b> {totals['крипта']:.0f} USDT\n"
+        text += f"  {totals['крипта']:.0f} / 2 = {half:.0f} USDT\n"
+        text += f"  {half:.0f} × {usd_to_gel:.2f} = {gel_val:.2f} gel\n"
+        crypto_gel = gel_val
+
+    # Драм
+    if totals["драм"] > 0:
+        half_usd = totals["драм"] * current_amd_to_usd / 2
+        gel_val = half_usd * usd_to_gel
+        text += f"\n<b>Драм:</b> {totals['драм']:.0f} драм\n"
+        text += f"  ≈ {totals['драм'] * current_amd_to_usd:.2f}$ / 2 = {half_usd:.2f}$\n"
+        text += f"  {half_usd:.2f} × {usd_to_gel:.2f} = {gel_val:.2f} gel\n"
+        total_gel += gel_val
+
+    cash_gel = total_gel
+    text += f"\n<b>Итого наличка:</b> {cash_gel:.2f} gel\n"
+
+    if crypto_gel > 0:
+        text += f"\n<b>Крипта (вся наша):</b>\n"
+        text += f"  {totals['крипта']:.0f} / 2 = {totals['крипта']/2:.0f} USDT\n"
+        text += f"  {totals['крипта']/2:.0f} × {usd_to_gel:.2f} = {crypto_gel:.2f} gel\n"
+        cash_after_crypto = cash_gel - crypto_gel
+        text += f"\n<b>Наличка за вычетом крипты:</b>\n"
+        text += f"  {cash_gel:.2f} − {crypto_gel:.2f} = {cash_after_crypto:.2f} gel\n"
+    else:
+        cash_after_crypto = cash_gel
+
+    # Расходы из expenses.json
+    expenses = get_expenses_for_period(date_from, date_to, chat_id_filter)
+    total_expenses_gel = 0
+    if expenses:
+        text += "\n<b>Расходы:</b>\n"
+        for e in sorted(expenses, key=lambda x: parse_date_str(x.get("date", "")) or datetime.min):
+            # Конвертируем расход в gel
+            exp_usd = e.get("amount_usd", 0)
+            exp_gel = exp_usd * usd_to_gel
+            cur_d = e.get("currency", "$")
+            text += f"  {e['date']} {e['type']}: {e['amount']:.0f} {cur_d} ≈ {exp_gel:.0f} gel\n"
+            total_expenses_gel += exp_gel
+        text += f"  <b>Итого расходов:</b> {total_expenses_gel:.0f} gel\n"
+
+    # Финальный расчёт
+    text += "\n<b>Финальный расчёт:</b>\n"
+    final = cash_after_crypto - total_expenses_gel
+    text += f"  {cash_after_crypto:.2f}"
+    if total_expenses_gel > 0:
+        text += f" − {total_expenses_gel:.0f} (расходы)"
+    text += f" = <b>{final:.2f} gel</b>\n"
+
+    return text
+
+
 def generate_operator_report(date_from: datetime, date_to: datetime, op_name: str) -> str:
     """Генерирует детальный отчёт по одному оператору (как в примере по Саше)."""
     update_exchange_rates()
@@ -1248,6 +1412,7 @@ async def handle_report_button(m: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="Ввести период", callback_data="rep:custom")],
         [InlineKeyboardButton(text="По оператору", callback_data="rep:operator")],
         [InlineKeyboardButton(text="Статистика операторов", callback_data="rep:stats")],
+        [InlineKeyboardButton(text="Касса девочки", callback_data="rep:girl")],
     ])
     await m.answer("<b>Отчёты</b>\n\nВыбери тип отчёта:", reply_markup=kb)
 
@@ -1269,6 +1434,7 @@ async def cmd_report(m: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="Ввести период", callback_data="rep:custom")],
         [InlineKeyboardButton(text="По оператору", callback_data="rep:operator")],
         [InlineKeyboardButton(text="Статистика операторов", callback_data="rep:stats")],
+        [InlineKeyboardButton(text="Касса девочки", callback_data="rep:girl")],
     ])
     await m.answer("<b>Отчёты</b>\n\nВыбери тип отчёта:", reply_markup=kb)
 
@@ -1324,6 +1490,39 @@ async def report_callbacks(c: types.CallbackQuery, state: FSMContext):
             parse_mode=ParseMode.HTML
         )
 
+    elif action == "girl":
+        # Показываем список чатов
+        excluded = set(str(ch) for ch in EXCLUDED_FROM_REPORTS)
+        buttons = []
+        for ch_id in ALLOWED_CHATS:
+            if str(ch_id) in excluded:
+                continue
+            try:
+                chat = await bot.get_chat(ch_id)
+                title = (chat.title or chat.first_name or str(ch_id)).strip()
+            except:
+                title = str(ch_id)
+            buttons.append([InlineKeyboardButton(text=title, callback_data=f"girlchat:{ch_id}")])
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await c.message.edit_text("Выбери чат:", reply_markup=kb)
+
+    await c.answer()
+
+
+# ----------- Касса девочки: выбор чата → период -----------
+@dp.callback_query(F.data.startswith("girlchat:"))
+async def girl_chat_selected(c: types.CallbackQuery, state: FSMContext):
+    if c.from_user.id not in OWNERS:
+        await c.answer("Нет доступа", show_alert=True)
+        return
+
+    chat_id = c.data.split(":", 1)[1]
+    await state.update_data(mode="girl", girl_chat_id=chat_id)
+    await state.set_state(ReportState.waiting_for_period)
+    await c.message.edit_text(
+        "Введи период:\n<code>27.01-12.02</code>",
+        parse_mode=ParseMode.HTML
+    )
     await c.answer()
 
 
@@ -1383,6 +1582,11 @@ async def handle_period_input(m: types.Message, state: FSMContext):
         await m.reply("Выбери оператора:", reply_markup=kb)
     elif mode == "stats":
         report = generate_operator_stats(date_from, date_to)
+        await safe_send(m, report)
+        await state.clear()
+    elif mode == "girl":
+        girl_chat_id = user_data.get("girl_chat_id", "")
+        report = generate_girl_report(date_from, date_to, girl_chat_id)
         await safe_send(m, report)
         await state.clear()
     else:
