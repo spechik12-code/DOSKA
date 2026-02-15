@@ -17,6 +17,16 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from config import TOKEN, OWNERS, ALLOWED_CHATS, EXCLUDED_FROM_REPORTS
+try:
+    from config import CRYPTO_WALLET, CRYPTO_CHAT
+except ImportError:
+    CRYPTO_WALLET = ""
+    CRYPTO_CHAT = 0
+
+try:
+    from config import CRYPTO_TOPIC
+except ImportError:
+    CRYPTO_TOPIC = None
 
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -2046,6 +2056,42 @@ async def handle_percent_input(m: types.Message, state: FSMContext):
 
 
 
+# ----------- /crypto — проверка баланса и последних поступлений -----------
+@dp.message(Command("crypto"))
+async def cmd_crypto(m: types.Message):
+    if not CRYPTO_WALLET:
+        await m.reply("Крипто-мониторинг не настроен.")
+        return
+
+    # Доступно в чате КРИПТА (или группе с топиком КРИПТА) и в ЛС владельцам
+    is_crypto_chat = (m.chat.id == CRYPTO_CHAT)
+    is_crypto_topic = (CRYPTO_TOPIC and m.message_thread_id == CRYPTO_TOPIC)
+    if not is_crypto_chat and not is_crypto_topic and m.from_user.id not in OWNERS:
+        return
+
+    balance = get_usdt_balance(CRYPTO_WALLET)
+    transfers = get_recent_usdt_transfers(CRYPTO_WALLET, limit=5)
+
+    wallet_short = f"{CRYPTO_WALLET[:6]}...{CRYPTO_WALLET[-4:]}"
+    text = f"<b>Крипто-кошелёк</b>\n"
+    text += f"Адрес: <code>{CRYPTO_WALLET}</code>\n"
+    text += f"<b>Баланс: {balance:.2f} USDT</b>\n\n"
+
+    if transfers:
+        text += "<b>Последние поступления:</b>\n"
+        for tx in transfers[:5]:
+            amount = float(tx.get("value", 0)) / 1_000_000
+            from_addr = tx.get("from", "—")
+            timestamp = tx.get("block_timestamp", 0)
+            tx_time = datetime.fromtimestamp(timestamp / 1000).strftime("%d.%m %H:%M") if timestamp else "—"
+            from_short = f"{from_addr[:6]}...{from_addr[-4:]}" if len(from_addr) > 10 else from_addr
+            text += f"  {tx_time} — {amount:.2f} USDT от {from_short}\n"
+    else:
+        text += "Поступлений пока нет.\n"
+
+    await m.reply(text, parse_mode=ParseMode.HTML)
+
+
 # ----------- /save_current — ручное сохранение текущих смен в архив -----------
 @dp.message(Command("save_current"))
 async def cmd_save_current(m: types.Message):
@@ -2078,6 +2124,136 @@ def cleanup_old_history():
         print(f"Очистка history: удалено {before - after} старых записей")
 
 
+# ==================== КРИПТО-МОНИТОРИНГ USDT TRC-20 ====================
+TRONGRID_API = "https://api.trongrid.io"
+USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"  # USDT TRC-20 contract
+
+last_seen_tx = None  # Последний обработанный txID
+
+
+def get_usdt_balance(wallet: str) -> float:
+    """Получает баланс USDT на кошельке."""
+    try:
+        # Метод 1: через trc20 балансы аккаунта
+        url = f"{TRONGRID_API}/v1/accounts/{wallet}"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json().get("data", [])
+            if data:
+                trc20 = data[0].get("trc20", [])
+                for token in trc20:
+                    if USDT_CONTRACT in token:
+                        return float(token[USDT_CONTRACT]) / 1_000_000
+    except:
+        pass
+    return 0.0
+
+
+def get_recent_usdt_transfers(wallet: str, limit: int = 5) -> list:
+    """Получает последние входящие USDT транзакции."""
+    try:
+        url = f"{TRONGRID_API}/v1/accounts/{wallet}/transactions/trc20"
+        params = {
+            "only_to": "true",
+            "contract_address": USDT_CONTRACT,
+            "limit": limit,
+        }
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get("data", [])
+    except:
+        pass
+    return []
+
+
+async def check_crypto_payments():
+    """Проверяет новые входящие USDT транзакции и отправляет уведомления."""
+    global last_seen_tx
+    if not CRYPTO_WALLET or not CRYPTO_CHAT:
+        return
+
+    try:
+        transfers = get_recent_usdt_transfers(CRYPTO_WALLET, limit=3)
+        if not transfers:
+            return
+
+        # При первом запуске запоминаем последнюю транзакцию
+        if last_seen_tx is None:
+            last_seen_tx = transfers[0].get("transaction_id", "")
+            return
+
+        # Проверяем новые транзакции
+        new_txs = []
+        for tx in transfers:
+            tx_id = tx.get("transaction_id", "")
+            if tx_id == last_seen_tx:
+                break
+            new_txs.append(tx)
+
+        if not new_txs:
+            return
+
+        # Обновляем last_seen
+        last_seen_tx = transfers[0].get("transaction_id", "")
+
+        # Получаем баланс
+        balance = get_usdt_balance(CRYPTO_WALLET)
+
+        # Отправляем уведомления
+        for tx in reversed(new_txs):
+            amount = float(tx.get("value", 0)) / 1_000_000
+            from_addr = tx.get("from", "неизвестно")
+            tx_id = tx.get("transaction_id", "")
+            timestamp = tx.get("block_timestamp", 0)
+            tx_time = datetime.fromtimestamp(timestamp / 1000).strftime("%d.%m.%Y %H:%M") if timestamp else "—"
+
+            from_short = f"{from_addr[:6]}...{from_addr[-4:]}" if len(from_addr) > 10 else from_addr
+
+            # Короткое сообщение для чата КРИПТА
+            msg_chat = (
+                f"<b>Поступление USDT</b>\n\n"
+                f"<b>Сумма:</b> {amount:.2f} USDT\n"
+                f"<b>Время:</b> {tx_time}\n"
+                f"<b>От:</b> {from_short}\n\n"
+                f"<b>Баланс кошелька:</b> {balance:.2f} USDT"
+            )
+
+            # Полное сообщение для владельцев
+            msg_owner = (
+                f"<b>Поступление USDT</b>\n\n"
+                f"<b>Сумма:</b> {amount:.2f} USDT\n"
+                f"<b>Время:</b> {tx_time}\n"
+                f"<b>От:</b> <code>{from_addr}</code>\n"
+                f"<b>Хеш:</b> <code>{tx_id}</code>\n\n"
+                f"<b>Баланс кошелька:</b> {balance:.2f} USDT"
+            )
+
+            try:
+                await bot.send_message(CRYPTO_CHAT, msg_chat, parse_mode=ParseMode.HTML,
+                                       message_thread_id=CRYPTO_TOPIC)
+            except Exception as e:
+                print(f"Ошибка отправки крипто-уведомления в чат: {e}")
+
+            # Дублируем владельцам в ЛС
+            for owner_id in OWNERS:
+                try:
+                    await bot.send_message(owner_id, msg_owner, parse_mode=ParseMode.HTML)
+                except:
+                    pass
+
+    except Exception as e:
+        print(f"Ошибка проверки крипто: {e}")
+
+
+async def crypto_monitor_loop():
+    """Цикл проверки крипто-платежей раз в 60 секунд."""
+    if not CRYPTO_WALLET or not CRYPTO_CHAT:
+        return
+    while True:
+        await check_crypto_payments()
+        await asyncio.sleep(60)
+
+
 async def scheduler():
     aioschedule.every().day.at("09:00").do(daily_job)
     aioschedule.every().day.at("08:59").do(send_summary_for_all_chats)
@@ -2093,6 +2269,9 @@ async def main():
     load_settings()
     await daily_job()
     asyncio.create_task(scheduler())
+    if CRYPTO_WALLET and CRYPTO_CHAT:
+        asyncio.create_task(crypto_monitor_loop())
+        print(f"Крипто-мониторинг запущен: {CRYPTO_WALLET[:8]}...")
     await dp.start_polling(bot)
 
 
