@@ -1211,25 +1211,44 @@ def generate_girl_report(date_from: datetime, date_to: datetime, chat_id_filter:
 
     # Расходы из expenses.json
     expenses = get_expenses_for_period(date_from, date_to, chat_id_filter)
-    total_expenses_gel = 0
+    rent_gel = 0        # Квартира — девочка должна нам
+    deduct_gel = 0      # Такси и прочее — вычитаем из кассы
+    photo_gel = 0       # Фотосессия — только статистика
+
     if expenses:
         text += "\n<b>Расходы:</b>\n"
         for e in sorted(expenses, key=lambda x: parse_date_str(x.get("date", "")) or datetime.min):
-            # Конвертируем расход в gel
             exp_usd = e.get("amount_usd", 0)
             exp_gel = exp_usd * usd_to_gel
             cur_d = e.get("currency", "$")
-            text += f"  {e['date']} {e['type']}: {e['amount']:.0f} {cur_d} ≈ {exp_gel:.0f} gel\n"
-            total_expenses_gel += exp_gel
-        text += f"  <b>Итого расходов:</b> {total_expenses_gel:.0f} gel\n"
+            exp_type = e.get("type", "").lower()
+
+            if "кварт" in exp_type:
+                text += f"  {e['date']} {e['type']}: {e['amount']:.0f} {cur_d} ≈ {exp_gel:.0f} gel (долг девочки)\n"
+                rent_gel += exp_gel
+            elif "фото" in exp_type:
+                text += f"  {e['date']} {e['type']}: {e['amount']:.0f} {cur_d} ≈ {exp_gel:.0f} gel (наш расход, не в кассе)\n"
+                photo_gel += exp_gel
+            else:
+                text += f"  {e['date']} {e['type']}: {e['amount']:.0f} {cur_d} ≈ {exp_gel:.0f} gel\n"
+                deduct_gel += exp_gel
+
+        if rent_gel > 0:
+            text += f"  <b>Квартира (долг):</b> +{rent_gel:.0f} gel\n"
+        if deduct_gel > 0:
+            text += f"  <b>Расходы (вычет):</b> −{deduct_gel:.0f} gel\n"
+        if photo_gel > 0:
+            text += f"  <b>Фотосессии (справочно):</b> {photo_gel:.0f} gel\n"
 
     # Финальный расчёт
     text += "\n<b>Финальный расчёт:</b>\n"
-    final = cash_after_crypto - total_expenses_gel
-    text += f"  {cash_after_crypto:.2f}"
-    if total_expenses_gel > 0:
-        text += f" − {total_expenses_gel:.0f} (расходы)"
-    text += f" = <b>{final:.2f} gel</b>\n"
+    final = cash_after_crypto + rent_gel - deduct_gel
+    parts_calc = [f"{cash_after_crypto:.2f}"]
+    if rent_gel > 0:
+        parts_calc.append(f"+ {rent_gel:.0f} (квартира)")
+    if deduct_gel > 0:
+        parts_calc.append(f"− {deduct_gel:.0f} (расходы)")
+    text += f"  {' '.join(parts_calc)} = <b>{final:.2f} gel</b>\n"
 
     return text
 
