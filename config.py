@@ -14,5 +14,20 @@ CRYPTO_WALLET = "TXErWyFpUEXAkzVLa5KiPWHFjNGEiyyEXq"
 CRYPTO_CHAT = -1003433213080   # ID группы-диспетчерской
 CRYPTO_TOPIC = 18420           # номер топика КРИПТА
 
+# Операторы (имя: telegram_id) — только активные, убери в отпуск через комментарий
+OPERATORS = {
+    "Саша": 7173685353,
+    "Кенди": 6209639062,
+    "Света": 7872313565,
+    "Катя": 7266324269,
+    "Лера": 6811911034,
+    # "фрик": 1958055178,       # в отпуске
+    # "Богдан": 1718993704,     # в отпуске
+}
+
+# Google Sheets
+GOOGLE_SHEET_ID = "1fZzZrjJGB2hxjMjMF97mLGfxBJ8Qt1R5rPPRVZ7pAdU"
+GOOGLE_SHEET_NAME = "xGeorgia"
+GOOGLE_CREDS_FILE = "google_creds.json"
 
 
