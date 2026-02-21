@@ -1,6 +1,5 @@
 # bot.py — ПОЛНАЯ ВЕРСИЯ С РАСХОДАМИ (ТОЛЬКО ОТОБРАЖЕНИЕ, БЕЗ ВЫЧИТАНИЯ ИЗ ВЫРУЧКИ)
 import asyncio
-import aioschedule
 import json
 import re
 import requests
@@ -2123,6 +2122,29 @@ async def cmd_crypto(m: types.Message):
     await m.reply(text, parse_mode=ParseMode.HTML)
 
 
+# ----------- /anketa — ручной запуск ротации (владельцы) -----------
+@dp.message(Command("anketa"))
+async def cmd_anketa(m: types.Message):
+    if m.from_user.id not in OWNERS:
+        return
+    if m.chat.type != "private":
+        await m.reply("Напиши в личку!")
+        return
+    if not OPERATORS or not GOOGLE_SHEET_ID:
+        await m.reply("Ротация анкет не настроена.")
+        return
+
+    a_state = load_anketa_state()
+    today = datetime.now().strftime("%d.%m.%Y")
+    if a_state.get("last_date") == today:
+        await m.reply(f"Анкеты уже распределены сегодня ({today}). Чтобы перераспределить — удали файл anketa_state.json и повтори.")
+        return
+
+    await m.reply("Запускаю ротацию анкет...")
+    await distribute_anketas()
+    await m.reply("Готово!")
+
+
 # ----------- /save_current — ручное сохранение текущих смен в архив -----------
 @dp.message(Command("save_current"))
 async def cmd_save_current(m: types.Message):
@@ -2471,12 +2493,29 @@ async def crypto_monitor_loop():
 
 
 async def scheduler():
-    aioschedule.every().day.at("09:00").do(daily_job)
-    aioschedule.every().day.at("08:59").do(send_summary_for_all_chats)
-    if OPERATORS and GOOGLE_SHEET_ID:
-        aioschedule.every().day.at("11:00").do(distribute_anketas)  # 14:00 Тбилиси = 11:00 МСК
+    """Свой scheduler без aioschedule — проверяет время каждые 30 сек."""
+    triggered_today = set()  # Какие задачи уже выполнены сегодня
+
     while True:
-        await aioschedule.run_pending()
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        hhmm = now.strftime("%H:%M")
+
+        # Сброс триггеров в полночь
+        if not any(today in t for t in triggered_today):
+            triggered_today.clear()
+
+        key = f"{today}_{hhmm}"
+
+        if hhmm == "09:00" and f"{today}_daily" not in triggered_today:
+            triggered_today.add(f"{today}_daily")
+            asyncio.create_task(daily_job())
+
+        if hhmm == "14:00" and f"{today}_anketa" not in triggered_today:
+            if OPERATORS and GOOGLE_SHEET_ID:
+                triggered_today.add(f"{today}_anketa")
+                asyncio.create_task(distribute_anketas())
+
         await asyncio.sleep(30)
 
 
