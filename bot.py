@@ -28,6 +28,14 @@ try:
 except ImportError:
     CRYPTO_TOPIC = None
 
+try:
+    from config import OPERATORS, GOOGLE_SHEET_ID, GOOGLE_SHEET_NAME, GOOGLE_CREDS_FILE
+except ImportError:
+    OPERATORS = {}
+    GOOGLE_SHEET_ID = ""
+    GOOGLE_SHEET_NAME = "xGeorgia"
+    GOOGLE_CREDS_FILE = "google_creds.json"
+
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -200,6 +208,10 @@ class ExpenseState(StatesGroup):
 class SettingsState(StatesGroup):
     waiting_for_rate = State()
     waiting_for_percent = State()
+
+
+class AnketaState(StatesGroup):
+    waiting_for_phone = State()
 
 
 # ==================== ГЛОБАЛЬНЫЕ РАСХОДЫ (expenses.json) ====================
@@ -2143,6 +2155,191 @@ def cleanup_old_history():
         print(f"Очистка history: удалено {before - after} старых записей")
 
 
+# ==================== РОТАЦИЯ АНКЕТ (Google Sheets) ====================
+ANKETA_FILE = "anketa_state.json"
+
+
+def load_anketa_state() -> dict:
+    try:
+        with open(ANKETA_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {"last_date": "", "offset": 0}
+
+
+def save_anketa_state(state_data: dict):
+    with open(ANKETA_FILE, "w", encoding="utf-8") as f:
+        json.dump(state_data, f, ensure_ascii=False, indent=2)
+
+
+def get_google_sheet():
+    """Подключается к Google Sheets и возвращает лист."""
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except ImportError:
+        print("gspread или google-auth не установлены! pip install gspread google-auth")
+        return None
+
+    try:
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=scopes)
+        gc = gspread.authorize(creds)
+        spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
+        sheet = spreadsheet.worksheet(GOOGLE_SHEET_NAME)
+        return sheet
+    except Exception as e:
+        print(f"Ошибка подключения к Google Sheets: {e}")
+        return None
+
+
+def get_active_anketas(sheet) -> list:
+    """Читает таблицу, возвращает активные анкеты (столбец D не пуст и не Off)."""
+    rows = sheet.get_all_values()
+    anketas = []
+    for i, row in enumerate(rows[1:], start=2):  # пропускаем заголовок, нумерация строк с 2
+        if len(row) < 6:
+            continue
+        col_d = row[3].strip() if len(row) > 3 else ""
+        if not col_d or col_d.lower() == "off":
+            continue
+        anketas.append({
+            "row": i,
+            "site": row[0].strip(),       # A — сайт
+            "login": row[1].strip(),       # B — логин
+            "password": row[2].strip(),    # C — пароль
+            "date": col_d,                 # D — дата
+            "operator": row[4].strip() if len(row) > 4 else "",  # E — оператор
+            "deva": row[5].strip() if len(row) > 5 else "",      # F — дева
+            "phone": row[6].strip() if len(row) > 6 else "",     # G — номер
+        })
+    return anketas
+
+
+async def distribute_anketas():
+    """Ротация анкет: распределяет активные анкеты среди операторов по кругу."""
+    if not OPERATORS or not GOOGLE_SHEET_ID:
+        return
+
+    sheet = get_google_sheet()
+    if not sheet:
+        return
+
+    anketas = get_active_anketas(sheet)
+    if not anketas:
+        print("Нет активных анкет.")
+        return
+
+    # Загружаем состояние ротации
+    a_state = load_anketa_state()
+    today = datetime.now().strftime("%d.%m.%Y")
+
+    # Если сегодня уже распределяли — пропускаем
+    if a_state.get("last_date") == today:
+        print("Анкеты уже распределены сегодня.")
+        return
+
+    # Увеличиваем offset
+    offset = a_state.get("offset", 0) + 1
+    a_state["last_date"] = today
+    a_state["offset"] = offset
+    save_anketa_state(a_state)
+
+    # Список активных операторов
+    op_list = list(OPERATORS.items())  # [(имя, tg_id), ...]
+    num_ops = len(op_list)
+    num_anketas = len(anketas)
+
+    if num_ops == 0:
+        return
+
+    # Распределяем по кругу
+    for i, (op_name, op_tg_id) in enumerate(op_list):
+        anketa_idx = (i + offset) % num_anketas
+        anketa = anketas[anketa_idx]
+
+        # Отправляем оператору в ЛС
+        msg = (
+            f"<b>Твоя анкета на сегодня:</b>\n\n"
+            f"<b>Дева:</b> {anketa['deva']}\n"
+            f"<b>Логин:</b> <code>{anketa['login']}</code>\n"
+            f"<b>Пароль:</b> <code>{anketa['password']}</code>\n\n"
+            f"Отправь номер телефона, который поставишь на эту анкету:"
+        )
+
+        try:
+            from aiogram.fsm.storage.memory import MemoryStorage
+            # Записываем в таблицу имя оператора (столбец E)
+            sheet.update_cell(anketa["row"], 5, op_name)
+
+            await bot.send_message(op_tg_id, msg, parse_mode=ParseMode.HTML)
+
+            # Сохраняем привязку оператор -> строка, чтобы записать номер позже
+            anketa_assignments[op_tg_id] = {
+                "row": anketa["row"],
+                "anketa": anketa,
+                "date": today,
+            }
+            print(f"Анкета {anketa['login']} → {op_name}")
+        except Exception as e:
+            print(f"Ошибка отправки анкеты {op_name}: {e}")
+
+    # Уведомляем владельцев
+    summary = f"<b>Анкеты распределены на {today}:</b>\n\n"
+    for i, (op_name, op_tg_id) in enumerate(op_list):
+        anketa_idx = (i + offset) % num_anketas
+        anketa = anketas[anketa_idx]
+        summary += f"{op_name} → {anketa['deva']} ({anketa['login']})\n"
+
+    for owner_id in OWNERS:
+        try:
+            await bot.send_message(owner_id, summary, parse_mode=ParseMode.HTML)
+        except:
+            pass
+
+
+# Хранилище привязок оператор -> строка в таблице (для записи номера)
+anketa_assignments = {}
+
+
+# ----------- Оператор отправляет номер (catch-all для ЛС) -----------
+@dp.message(F.chat.type == "private")
+async def handle_operator_phone(m: types.Message, state: FSMContext):
+    """Если оператор написал номер после получения анкеты."""
+    tg_id = m.from_user.id
+
+    # Не перехватываем, если владелец в процессе ввода (FSM)
+    current_state = await state.get_state()
+    if current_state:
+        return
+
+    # Проверяем — есть ли привязка
+    assignment = anketa_assignments.get(tg_id)
+    if not assignment:
+        return  # Не наш кейс — пропускаем
+
+    # Проверяем что сообщение похоже на номер (цифры, +, пробелы)
+    phone = m.text.strip() if m.text else ""
+    if not re.match(r"^[\d\s\+\-\(\)]{7,20}$", phone):
+        return  # Не похоже на номер — пропускаем
+
+    # Записываем номер в Google Sheets (столбец G)
+    try:
+        sheet = get_google_sheet()
+        if sheet:
+            sheet.update_cell(assignment["row"], 7, phone)
+            await m.reply(f"Номер <b>{phone}</b> записан. Удачной смены!", parse_mode=ParseMode.HTML)
+            # Удаляем привязку — номер записан
+            del anketa_assignments[tg_id]
+        else:
+            await m.reply("Ошибка подключения к таблице. Отправь номер ещё раз.")
+    except Exception as e:
+        await m.reply(f"Ошибка записи: {e}")
+
+
 # ==================== КРИПТО-МОНИТОРИНГ USDT TRC-20 ====================
 TRONGRID_API = "https://api.trongrid.io"
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"  # USDT TRC-20 contract
@@ -2276,6 +2473,8 @@ async def crypto_monitor_loop():
 async def scheduler():
     aioschedule.every().day.at("09:00").do(daily_job)
     aioschedule.every().day.at("08:59").do(send_summary_for_all_chats)
+    if OPERATORS and GOOGLE_SHEET_ID:
+        aioschedule.every().day.at("11:00").do(distribute_anketas)  # 14:00 Тбилиси = 11:00 МСК
     while True:
         await aioschedule.run_pending()
         await asyncio.sleep(30)
