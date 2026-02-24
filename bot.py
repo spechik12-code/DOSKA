@@ -226,6 +226,8 @@ class SettingsState(StatesGroup):
     waiting_for_rate = State()
     waiting_for_percent = State()
     waiting_for_admin_percent = State()
+    waiting_for_dayoff_operator = State()
+    waiting_for_dayoff_dates = State()
 
 
 class AnketaState(StatesGroup):
@@ -1401,6 +1403,43 @@ def generate_operator_report(date_from: datetime, date_to: datetime, op_name: st
     return text
 
 
+def generate_admin_report(date_from: datetime, date_to: datetime, admin_name: str) -> str:
+    """Генерирует отчёт ЗП по админу — от общей кассы за период."""
+    update_exchange_rates()
+    shifts = get_shifts_for_period(date_from, date_to)
+
+    period_str = f"{date_from.strftime('%d.%m')} — {date_to.strftime('%d.%m.%Y')}"
+
+    # Считаем общую кассу по чатам
+    chat_totals = {}  # {chat_title: usd}
+    grand_total = 0
+
+    for shift in shifts:
+        chat_title = shift.get("chat_title", "Неизвестно")
+        came = [b for b in shift.get("bookings", []) if b.get("done") and not b.get("deleted")]
+        for b in came:
+            usd, _ = extract_booking_usd(b)
+            if chat_title not in chat_totals:
+                chat_totals[chat_title] = 0
+            chat_totals[chat_title] += usd
+            grand_total += usd
+
+    percent = get_admin_salary_percent(admin_name)
+    salary = grand_total * percent
+
+    text = f"<b>Отчёт по админу: {admin_name}</b>\n"
+    text += f"<b>Период: {period_str}</b>\n\n"
+
+    text += "<b>Касса по чатам:</b>\n"
+    for title, usd in sorted(chat_totals.items()):
+        text += f"  {title}: {usd:.0f}$\n"
+
+    text += f"\n<b>Общая касса:</b> {grand_total:.0f}$\n"
+    text += f"<b>ЗП {admin_name} ({percent*100:.1f}%):</b> {salary:.2f}$\n"
+
+    return text
+
+
 def get_all_operators(date_from: datetime, date_to: datetime) -> list[str]:
     """Возвращает список уникальных операторов за период."""
     shifts = get_shifts_for_period(date_from, date_to)
@@ -1620,8 +1659,8 @@ async def handle_report_button(m: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="Эта неделя (Пн–Вс)", callback_data="rep:this_week")],
         [InlineKeyboardButton(text="Прошлая неделя", callback_data="rep:last_week")],
         [InlineKeyboardButton(text="Ввести период", callback_data="rep:custom")],
-        [InlineKeyboardButton(text="По оператору", callback_data="rep:operator")],
-        [InlineKeyboardButton(text="Статистика операторов", callback_data="rep:stats")],
+        [InlineKeyboardButton(text="По сотруднику", callback_data="rep:operator")],
+        [InlineKeyboardButton(text="Статистика сотрудников", callback_data="rep:stats")],
         [InlineKeyboardButton(text="Касса девочки", callback_data="rep:girl")],
     ])
     await m.answer("<b>Отчёты</b>\n\nВыбери тип отчёта:", reply_markup=kb)
@@ -1642,8 +1681,8 @@ async def cmd_report(m: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="Эта неделя (Пн–Вс)", callback_data="rep:this_week")],
         [InlineKeyboardButton(text="Прошлая неделя", callback_data="rep:last_week")],
         [InlineKeyboardButton(text="Ввести период", callback_data="rep:custom")],
-        [InlineKeyboardButton(text="По оператору", callback_data="rep:operator")],
-        [InlineKeyboardButton(text="Статистика операторов", callback_data="rep:stats")],
+        [InlineKeyboardButton(text="По сотруднику", callback_data="rep:operator")],
+        [InlineKeyboardButton(text="Статистика сотрудников", callback_data="rep:stats")],
         [InlineKeyboardButton(text="Касса девочки", callback_data="rep:girl")],
     ])
     await m.answer("<b>Отчёты</b>\n\nВыбери тип отчёта:", reply_markup=kb)
@@ -1766,7 +1805,7 @@ async def handle_period_input(m: types.Message, state: FSMContext):
         # Показываем список операторов за период кнопками
         operators = get_all_operators(date_from, date_to)
         if not operators:
-            await m.reply("За этот период нет данных по операторам.")
+            await m.reply("За этот период нет данных по сотрудникам.")
             await state.clear()
             return
 
@@ -1785,11 +1824,24 @@ async def handle_period_input(m: types.Message, state: FSMContext):
                 row = []
         if row:
             buttons.append(row)
-        # Кнопка "Все операторы"
+
+        # Кнопки админов
+        admin_pct = settings.get("admin_salary_percent", {})
+        all_admins = sorted(set(list(ADMIN_SALARY_PERCENT.keys()) + list(admin_pct.keys())))
+        if all_admins:
+            admin_row = []
+            for aname in all_admins:
+                admin_row.append(InlineKeyboardButton(text=aname, callback_data=f"op:admin_{aname}"))
+                if len(admin_row) == 2:
+                    buttons.append(admin_row)
+                    admin_row = []
+            if admin_row:
+                buttons.append(admin_row)
+
         buttons.append([InlineKeyboardButton(text="Все операторы (общий)", callback_data="op:__ALL__")])
 
         kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await m.reply("Выбери оператора:", reply_markup=kb)
+        await m.reply("Выбери сотрудника:", reply_markup=kb)
     elif mode == "stats":
         report = generate_operator_stats(date_from, date_to)
         await safe_send(m, report)
@@ -1828,6 +1880,10 @@ async def handle_operator_select(c: types.CallbackQuery, state: FSMContext):
 
     if op_name == "__ALL__":
         report = generate_period_report(date_from, date_to)
+    elif op_name.startswith("admin_"):
+        # Отчёт по админу
+        admin_name = op_name[6:]  # убираем "admin_"
+        report = generate_admin_report(date_from, date_to, admin_name)
     else:
         report = generate_operator_report(date_from, date_to, op_name)
 
@@ -2154,14 +2210,25 @@ async def handle_settings_button(m: types.Message, state: FSMContext):
         f"<b>Текущие:</b> 1 лари = {current_lari_to_usd:.4f}$, 1 драм = {current_amd_to_usd:.5f}$\n\n"
         f"<b>Проценты ЗП операторов:</b>\n{pct_info}\n"
         f"  По умолчанию: {int(settings.get('default_percent', DEFAULT_PERCENT)*100)}%\n\n"
-        f"<b>Проценты ЗП админов:</b>\n{admin_pct_info}"
+        f"<b>Проценты ЗП админов:</b>\n{admin_pct_info}\n\n"
     )
+
+    # Выходные операторов
+    dayoffs = settings.get("dayoffs", {})
+    if dayoffs:
+        text += "<b>Выходные операторов:</b>\n"
+        for op_name in sorted(dayoffs.keys()):
+            dates = sorted(dayoffs[op_name])
+            text += f"  {op_name}: {', '.join(dates)}\n"
+    else:
+        text += "<b>Выходные операторов:</b> не заданы"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Установить курсы валют", callback_data="set:rates")],
         [InlineKeyboardButton(text="Сбросить курсы (авто)", callback_data="set:rates_reset")],
         [InlineKeyboardButton(text="Настроить % оператора", callback_data="set:percent")],
         [InlineKeyboardButton(text="Настроить % админа", callback_data="set:admin_percent")],
+        [InlineKeyboardButton(text="Выходные оператора", callback_data="set:dayoff")],
     ])
     await m.answer(text, reply_markup=kb)
 
@@ -2210,10 +2277,98 @@ async def settings_callbacks(c: types.CallbackQuery, state: FSMContext):
             parse_mode=ParseMode.HTML
         )
 
+    elif action == "dayoff":
+        # Показываем список операторов для выбора
+        buttons = []
+        row = []
+        for op_name in sorted(OPERATORS.keys()):
+            row.append(InlineKeyboardButton(text=op_name, callback_data=f"dayoff_op:{op_name}"))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append([InlineKeyboardButton(text="Очистить все выходные", callback_data="dayoff_op:__CLEAR__")])
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await c.message.edit_text("Выбери оператора:", reply_markup=kb)
+
     await c.answer()
 
 
-@dp.message(StateFilter(SettingsState.waiting_for_rate))
+@dp.callback_query(F.data.startswith("dayoff_op:"))
+async def dayoff_operator_select(c: types.CallbackQuery, state: FSMContext):
+    if c.from_user.id not in OWNERS:
+        await c.answer("Нет доступа", show_alert=True)
+        return
+
+    op_name = c.data.split(":", 1)[1]
+
+    if op_name == "__CLEAR__":
+        settings["dayoffs"] = {}
+        save_settings()
+        await c.message.edit_text("Все выходные очищены.")
+        await c.answer()
+        return
+
+    # Показываем текущие выходные оператора
+    dayoffs = settings.get("dayoffs", {})
+    current = dayoffs.get(op_name, [])
+    current_str = ", ".join(sorted(current)) if current else "нет"
+
+    await state.update_data(dayoff_operator=op_name)
+    await state.set_state(SettingsState.waiting_for_dayoff_dates)
+    await c.message.edit_text(
+        f"<b>Выходные {op_name}</b>\n"
+        f"Сейчас: {current_str}\n\n"
+        f"Введи даты выходных через запятую:\n"
+        f"<code>25.02, 26.02, 01.03</code>\n\n"
+        f"Для очистки выходных напиши: <code>очистить</code>",
+        parse_mode=ParseMode.HTML
+    )
+    await c.answer()
+
+
+@dp.message(StateFilter(SettingsState.waiting_for_dayoff_dates))
+async def handle_dayoff_dates_input(m: types.Message, state: FSMContext):
+    if m.from_user.id not in OWNERS or m.chat.type != "private":
+        return
+
+    user_data = await state.get_data()
+    op_name = user_data.get("dayoff_operator", "")
+    if not op_name:
+        await state.clear()
+        return
+
+    text = m.text.strip()
+
+    if text.lower() in ["очистить", "clear", "сброс"]:
+        dayoffs = settings.get("dayoffs", {})
+        dayoffs.pop(op_name, None)
+        settings["dayoffs"] = dayoffs
+        save_settings()
+        await m.reply(f"Выходные {op_name} очищены.")
+        await state.clear()
+        return
+
+    # Парсим даты
+    dates = []
+    for part in text.split(","):
+        part = part.strip()
+        d = parse_date_str(part)
+        if d:
+            dates.append(d.strftime("%d.%m.%Y"))
+
+    if not dates:
+        await m.reply("Не удалось разобрать даты. Формат: <code>25.02, 26.02</code>", parse_mode=ParseMode.HTML)
+        return
+
+    if "dayoffs" not in settings:
+        settings["dayoffs"] = {}
+    settings["dayoffs"][op_name] = dates
+    save_settings()
+
+    await m.reply(f"Выходные {op_name}: {', '.join(dates)}")
+    await state.clear()
 async def handle_rate_input(m: types.Message, state: FSMContext):
     if m.from_user.id not in OWNERS or m.chat.type != "private":
         return
@@ -2483,8 +2638,16 @@ async def distribute_anketas():
     a_state["offset"] = offset
     save_anketa_state(a_state)
 
-    # Список активных операторов
-    op_list = list(OPERATORS.items())  # [(имя, tg_id), ...]
+    # Список активных операторов (без выходных)
+    dayoffs = settings.get("dayoffs", {})
+    op_list = []
+    for name, tg_id in OPERATORS.items():
+        op_dayoffs = dayoffs.get(name, [])
+        if today in op_dayoffs:
+            print(f"{name} — выходной ({today}), пропускаем")
+            continue
+        op_list.append((name, tg_id))
+
     num_ops = len(op_list)
     num_anketas = len(anketas)
 
