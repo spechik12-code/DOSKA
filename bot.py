@@ -232,6 +232,10 @@ class AnketaState(StatesGroup):
     waiting_for_phone = State()
 
 
+class OperatorSalaryState(StatesGroup):
+    waiting_for_period = State()
+
+
 # ==================== ГЛОБАЛЬНЫЕ РАСХОДЫ (expenses.json) ====================
 EXPENSES_FILE = "expenses.json"
 global_expenses = []  # [{chat_id, chat_title, date, type, amount, currency, amount_usd, comment, created_at, id}]
@@ -1466,6 +1470,7 @@ def generate_operator_stats(date_from: datetime, date_to: datetime) -> str:
 REPORT_BUTTON_TEXT = "Отчёты"
 EXPENSE_BUTTON_TEXT = "Расходы"
 SETTINGS_BUTTON_TEXT = "Настройки"
+MY_SALARY_BUTTON_TEXT = "Моя ЗП"
 
 owner_kb = ReplyKeyboardMarkup(
     keyboard=[
@@ -1475,14 +1480,124 @@ owner_kb = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+operator_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=MY_SALARY_BUTTON_TEXT)],
+    ],
+    resize_keyboard=True,
+)
+
+
+def get_operator_name_by_tg_id(tg_id: int) -> str:
+    """Возвращает имя оператора по его Telegram ID."""
+    for name, op_id in OPERATORS.items():
+        if op_id == tg_id:
+            return name
+    return ""
+
 
 @dp.message(Command("start"))
 async def cmd_start_private(m: types.Message):
     if m.chat.type != "private":
         return
-    if m.from_user.id not in OWNERS:
+    if m.from_user.id in OWNERS:
+        await m.answer("Привет! Кнопка отчётов — внизу", reply_markup=owner_kb)
+    elif get_operator_name_by_tg_id(m.from_user.id):
+        await m.answer("Привет! Ты можешь посмотреть свою ЗП", reply_markup=operator_kb)
+    # Остальные — молчим
+
+
+# ----------- Обработка кнопки «Моя ЗП» для операторов -----------
+@dp.message(F.text == MY_SALARY_BUTTON_TEXT, F.chat.type == "private")
+async def handle_my_salary_button(m: types.Message, state: FSMContext):
+    op_name = get_operator_name_by_tg_id(m.from_user.id)
+    if not op_name:
         return
-    await m.answer("Привет! Кнопка отчётов — внизу", reply_markup=owner_kb)
+
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Эта неделя", callback_data="mysalary:this_week")],
+        [InlineKeyboardButton(text="Прошлая неделя", callback_data="mysalary:last_week")],
+        [InlineKeyboardButton(text="Свой период", callback_data="mysalary:custom")],
+    ])
+    await m.answer(f"<b>{op_name}, выбери период:</b>", reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+def generate_my_salary_report(date_from: datetime, date_to: datetime, op_name: str) -> str:
+    """Отчёт ЗП для оператора — используем полный отчёт по оператору."""
+    return generate_operator_report(date_from, date_to, op_name)
+
+
+@dp.callback_query(F.data.startswith("mysalary:"))
+async def my_salary_callbacks(c: types.CallbackQuery, state: FSMContext):
+    op_name = get_operator_name_by_tg_id(c.from_user.id)
+    if not op_name:
+        await c.answer("Нет доступа", show_alert=True)
+        return
+
+    action = c.data.split(":", 1)[1]
+
+    if action == "this_week":
+        now = datetime.now()
+        monday = now - timedelta(days=now.weekday())
+        date_from = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+        date_to = now
+        report = generate_my_salary_report(date_from, date_to, op_name)
+        await safe_send(bot, c.from_user.id, report, parse_mode=ParseMode.HTML)
+
+    elif action == "last_week":
+        now = datetime.now()
+        monday = now - timedelta(days=now.weekday() + 7)
+        sunday = monday + timedelta(days=6)
+        date_from = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+        date_to = sunday.replace(hour=23, minute=59, second=59)
+        report = generate_my_salary_report(date_from, date_to, op_name)
+        await safe_send(bot, c.from_user.id, report, parse_mode=ParseMode.HTML)
+
+    elif action == "custom":
+        await state.set_state(OperatorSalaryState.waiting_for_period)
+        await c.message.edit_text(
+            "Введи период в формате:\n<code>01.02-15.02</code>",
+            parse_mode=ParseMode.HTML
+        )
+
+    await c.answer()
+
+
+@dp.message(StateFilter(OperatorSalaryState.waiting_for_period))
+async def handle_operator_salary_period(m: types.Message, state: FSMContext):
+    if m.chat.type != "private":
+        return
+    op_name = get_operator_name_by_tg_id(m.from_user.id)
+    if not op_name:
+        return
+
+    text = m.text.strip()
+    match = re.match(r"(\d{1,2}\.\d{1,2})(?:\.(\d{2,4}))?\s*[-–]\s*(\d{1,2}\.\d{1,2})(?:\.(\d{2,4}))?", text)
+    if not match:
+        await m.reply("Формат: <code>01.02-15.02</code>", parse_mode=ParseMode.HTML)
+        return
+
+    year = datetime.now().year
+    try:
+        d1 = match.group(1)
+        y1 = match.group(2) or str(year)
+        if len(y1) == 2:
+            y1 = "20" + y1
+        date_from = datetime.strptime(f"{d1}.{y1}", "%d.%m.%Y")
+
+        d2 = match.group(3)
+        y2 = match.group(4) or str(year)
+        if len(y2) == 2:
+            y2 = "20" + y2
+        date_to = datetime.strptime(f"{d2}.{y2}", "%d.%m.%Y").replace(hour=23, minute=59, second=59)
+    except:
+        await m.reply("Неверная дата. Формат: <code>01.02-15.02</code>", parse_mode=ParseMode.HTML)
+        return
+
+    report = generate_my_salary_report(date_from, date_to, op_name)
+    await safe_send(bot, m.from_user.id, report, parse_mode=ParseMode.HTML)
+    await state.clear()
 
 
 # ----------- Обработка нажатия текстовой кнопки «Отчёты» -----------
