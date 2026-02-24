@@ -1542,8 +1542,11 @@ async def my_salary_callbacks(c: types.CallbackQuery, state: FSMContext):
         monday = now - timedelta(days=now.weekday())
         date_from = monday.replace(hour=0, minute=0, second=0, microsecond=0)
         date_to = now
-        report = generate_my_salary_report(date_from, date_to, op_name)
-        await safe_send(bot, c.from_user.id, report, parse_mode=ParseMode.HTML)
+        try:
+            report = generate_my_salary_report(date_from, date_to, op_name)
+            await safe_send(c.message, report)
+        except Exception as e:
+            await bot.send_message(c.from_user.id, f"Ошибка: {e}")
 
     elif action == "last_week":
         now = datetime.now()
@@ -1551,8 +1554,11 @@ async def my_salary_callbacks(c: types.CallbackQuery, state: FSMContext):
         sunday = monday + timedelta(days=6)
         date_from = monday.replace(hour=0, minute=0, second=0, microsecond=0)
         date_to = sunday.replace(hour=23, minute=59, second=59)
-        report = generate_my_salary_report(date_from, date_to, op_name)
-        await safe_send(bot, c.from_user.id, report, parse_mode=ParseMode.HTML)
+        try:
+            report = generate_my_salary_report(date_from, date_to, op_name)
+            await safe_send(c.message, report)
+        except Exception as e:
+            await bot.send_message(c.from_user.id, f"Ошибка: {e}")
 
     elif action == "custom":
         await state.set_state(OperatorSalaryState.waiting_for_period)
@@ -1596,7 +1602,10 @@ async def handle_operator_salary_period(m: types.Message, state: FSMContext):
         return
 
     report = generate_my_salary_report(date_from, date_to, op_name)
-    await safe_send(bot, m.from_user.id, report, parse_mode=ParseMode.HTML)
+    try:
+        await safe_send(m, report)
+    except Exception as e:
+        await m.reply(f"Ошибка: {e}")
     await state.clear()
 
 
