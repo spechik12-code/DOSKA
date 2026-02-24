@@ -88,6 +88,24 @@ SALARY_PERCENT = {
 DEFAULT_PERCENT = 0.10
 
 
+# ==================== ПРОЦЕНТЫ ЗП АДМИНОВ ====================
+ADMIN_SALARY_PERCENT = {
+    "Иван": 0.05,
+    "Марта": 0.03,
+    "Софа": 0.015,
+}
+
+DEFAULT_ADMIN_PERCENT = 0.03
+
+
+def get_admin_salary_percent(name: str) -> float:
+    """Берёт процент админа из settings, если есть, иначе из ADMIN_SALARY_PERCENT."""
+    custom = settings.get("admin_salary_percent", {})
+    if name in custom:
+        return custom[name]
+    return ADMIN_SALARY_PERCENT.get(name, settings.get("default_admin_percent", DEFAULT_ADMIN_PERCENT))
+
+
 def get_salary_percent(name: str) -> float:
     """Берёт процент из settings, если есть, иначе из SALARY_PERCENT / DEFAULT_PERCENT."""
     custom = settings.get("salary_percent", {})
@@ -207,6 +225,7 @@ class ExpenseState(StatesGroup):
 class SettingsState(StatesGroup):
     waiting_for_rate = State()
     waiting_for_percent = State()
+    waiting_for_admin_percent = State()
 
 
 class AnketaState(StatesGroup):
@@ -715,6 +734,18 @@ async def generate_summary_text(chat_str: str) -> str:
             salary = usd * percent
             result += f"{name}: {salary:.2f} USD ({int(percent*100)}%)\n"
 
+    # ЗП админов (от полной суммы всех операторов)
+    total_all_usd = sum(operator_money.values())
+    if total_all_usd > 0:
+        admin_pct = settings.get("admin_salary_percent", {})
+        all_admins = set(list(ADMIN_SALARY_PERCENT.keys()) + list(admin_pct.keys()))
+        if all_admins:
+            result += "\n<b>ЗП админам (от полной суммы):</b>\n"
+            for aname in sorted(all_admins):
+                apct = get_admin_salary_percent(aname)
+                asal = total_all_usd * apct
+                result += f"{aname}: {asal:.2f} USD ({apct*100:.1f}%)\n"
+
     full_message = header + board_text + result
     return full_message
 
@@ -1048,7 +1079,22 @@ def generate_period_report(date_from: datetime, date_to: datetime) -> str:
             salary = usd * percent
             total_salary += salary
             text += f"  {name}: {salary:.2f}$ ({int(percent*100)}%) — от кассы {usd:.0f}$\n"
-        text += f"\n  <b>Итого ЗП:</b> {total_salary:.2f}$\n"
+        text += f"\n  <b>Итого ЗП операторов:</b> {total_salary:.2f}$\n"
+    else:
+        text += "  Нет данных\n"
+
+    # ЗП админов
+    text += "\n<b>ЗП админов:</b>\n"
+    if grand_total > 0:
+        admin_pct = settings.get("admin_salary_percent", {})
+        all_admins = set(list(ADMIN_SALARY_PERCENT.keys()) + list(admin_pct.keys()))
+        total_admin_salary = 0
+        for aname in sorted(all_admins):
+            apct = get_admin_salary_percent(aname)
+            asal = grand_total * apct
+            total_admin_salary += asal
+            text += f"  {aname}: {asal:.2f}$ ({apct*100:.1f}%) — от общей кассы {grand_total:.0f}$\n"
+        text += f"\n  <b>Итого ЗП админов:</b> {total_admin_salary:.2f}$\n"
     else:
         text += "  Нет данных\n"
 
@@ -1969,18 +2015,29 @@ async def handle_settings_button(m: types.Message, state: FSMContext):
         pct_lines.append(f"  {name}: {int(pct*100)}%")
     pct_info = "\n".join(pct_lines) if pct_lines else "  По умолчанию 10%"
 
+    # Проценты админов
+    admin_pct = settings.get("admin_salary_percent", {})
+    admin_lines = []
+    all_admin_names = set(list(ADMIN_SALARY_PERCENT.keys()) + list(admin_pct.keys()))
+    for name in sorted(all_admin_names):
+        pct = get_admin_salary_percent(name)
+        admin_lines.append(f"  {name}: {pct*100:.1f}%")
+    admin_pct_info = "\n".join(admin_lines) if admin_lines else "  Нет админов"
+
     text = (
         f"<b>Настройки</b>\n\n"
         f"<b>Курсы валют:</b> {rates_info}\n"
         f"<b>Текущие:</b> 1 лари = {current_lari_to_usd:.4f}$, 1 драм = {current_amd_to_usd:.5f}$\n\n"
-        f"<b>Проценты ЗП:</b>\n{pct_info}\n"
-        f"  По умолчанию: {int(settings.get('default_percent', DEFAULT_PERCENT)*100)}%"
+        f"<b>Проценты ЗП операторов:</b>\n{pct_info}\n"
+        f"  По умолчанию: {int(settings.get('default_percent', DEFAULT_PERCENT)*100)}%\n\n"
+        f"<b>Проценты ЗП админов:</b>\n{admin_pct_info}"
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Установить курсы валют", callback_data="set:rates")],
         [InlineKeyboardButton(text="Сбросить курсы (авто)", callback_data="set:rates_reset")],
         [InlineKeyboardButton(text="Настроить % оператора", callback_data="set:percent")],
+        [InlineKeyboardButton(text="Настроить % админа", callback_data="set:admin_percent")],
     ])
     await m.answer(text, reply_markup=kb)
 
@@ -2016,6 +2073,16 @@ async def settings_callbacks(c: types.CallbackQuery, state: FSMContext):
             "<code>Саша 12</code> или <code>Лера 10</code>\n\n"
             "Для изменения процента по умолчанию:\n"
             "<code>по_умолчанию 10</code>",
+            parse_mode=ParseMode.HTML
+        )
+
+    elif action == "admin_percent":
+        await state.set_state(SettingsState.waiting_for_admin_percent)
+        await c.message.edit_text(
+            "Введи процент админа в формате:\n"
+            "<code>Иван 5</code> или <code>Марта 3</code>\n\n"
+            "Для дробных процентов:\n"
+            "<code>Софа 1.5</code>",
             parse_mode=ParseMode.HTML
         )
 
@@ -2084,6 +2151,28 @@ async def handle_percent_input(m: types.Message, state: FSMContext):
 
     await state.clear()
 
+
+@dp.message(StateFilter(SettingsState.waiting_for_admin_percent))
+async def handle_admin_percent_input(m: types.Message, state: FSMContext):
+    if m.from_user.id not in OWNERS or m.chat.type != "private":
+        return
+
+    text = m.text.strip()
+    match = re.match(r"^(\S+)\s+(\d+(?:\.\d+)?)$", text, re.I)
+    if not match:
+        await m.reply("Формат: <code>Иван 5</code> или <code>Софа 1.5</code>", parse_mode=ParseMode.HTML)
+        return
+
+    name = match.group(1)
+    pct = float(match.group(2)) / 100
+
+    if "admin_salary_percent" not in settings:
+        settings["admin_salary_percent"] = {}
+    settings["admin_salary_percent"][name] = pct
+    save_settings()
+    await m.reply(f"Процент админа {name}: {pct*100:.1f}%")
+
+    await state.clear()
 
 
 # ----------- /crypto — проверка баланса и последних поступлений -----------
