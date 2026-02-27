@@ -2504,12 +2504,14 @@ async def cmd_anketa(m: types.Message):
 
     a_state = load_anketa_state()
     today = datetime.now().strftime("%d.%m.%Y")
-    if a_state.get("last_date") == today:
-        await m.reply(f"Анкеты уже распределены сегодня ({today}). Чтобы перераспределить — удали файл anketa_state.json и повтори.")
-        return
+    already = a_state.get("last_date") == today
 
-    await m.reply("Запускаю ротацию анкет...")
-    await distribute_anketas()
+    if already:
+        await m.reply("Перераспределяю анкеты...")
+    else:
+        await m.reply("Запускаю ротацию анкет...")
+
+    await distribute_anketas(force=True)
     await m.reply("Готово!")
 
 
@@ -2609,7 +2611,7 @@ def get_active_anketas(sheet) -> list:
     return anketas
 
 
-async def distribute_anketas():
+async def distribute_anketas(force: bool = False):
     """Ротация анкет: распределяет активные анкеты среди операторов по кругу."""
     if not OPERATORS or not GOOGLE_SHEET_ID:
         return
@@ -2627,13 +2629,17 @@ async def distribute_anketas():
     a_state = load_anketa_state()
     today = datetime.now().strftime("%d.%m.%Y")
 
-    # Если сегодня уже распределяли — пропускаем
-    if a_state.get("last_date") == today:
+    # Если сегодня уже распределяли и не force — пропускаем
+    if a_state.get("last_date") == today and not force:
         print("Анкеты уже распределены сегодня.")
         return
 
-    # Увеличиваем offset
-    offset = a_state.get("offset", 0) + 1
+    # Увеличиваем offset только при первом распределении за день
+    if a_state.get("last_date") != today:
+        offset = a_state.get("offset", 0) + 1
+    else:
+        offset = a_state.get("offset", 0)
+
     a_state["last_date"] = today
     a_state["offset"] = offset
     save_anketa_state(a_state)
@@ -2654,8 +2660,19 @@ async def distribute_anketas():
     if num_ops == 0:
         return
 
-    # Распределяем по кругу
+    # Очищаем старые привязки
+    anketa_assignments.clear()
+
+    # Распределяем — каждая анкета только одному оператору
+    assigned_ops = []
+    unassigned_ops = []
+
     for i, (op_name, op_tg_id) in enumerate(op_list):
+        if i >= num_anketas:
+            # Операторов больше чем анкет — лишние без анкеты
+            unassigned_ops.append(op_name)
+            continue
+
         anketa_idx = (i + offset) % num_anketas
         anketa = anketas[anketa_idx]
 
@@ -2669,28 +2686,29 @@ async def distribute_anketas():
         )
 
         try:
-            from aiogram.fsm.storage.memory import MemoryStorage
             # Записываем в таблицу имя оператора (столбец E)
             sheet.update_cell(anketa["row"], 5, op_name)
 
             await bot.send_message(op_tg_id, msg, parse_mode=ParseMode.HTML)
 
-            # Сохраняем привязку оператор -> строка, чтобы записать номер позже
+            # Сохраняем привязку оператор -> строка (работает весь день)
             anketa_assignments[op_tg_id] = {
                 "row": anketa["row"],
                 "anketa": anketa,
                 "date": today,
             }
+            assigned_ops.append((op_name, anketa))
             print(f"Анкета {anketa['login']} → {op_name}")
         except Exception as e:
             print(f"Ошибка отправки анкеты {op_name}: {e}")
 
     # Уведомляем владельцев
     summary = f"<b>Анкеты распределены на {today}:</b>\n\n"
-    for i, (op_name, op_tg_id) in enumerate(op_list):
-        anketa_idx = (i + offset) % num_anketas
-        anketa = anketas[anketa_idx]
+    for op_name, anketa in assigned_ops:
         summary += f"{op_name} → {anketa['deva']} ({anketa['login']})\n"
+
+    if unassigned_ops:
+        summary += f"\n<b>Без анкеты (не хватило):</b> {', '.join(unassigned_ops)}\n"
 
     for owner_id in OWNERS:
         try:
@@ -2729,9 +2747,8 @@ async def handle_operator_phone(m: types.Message, state: FSMContext):
         sheet = get_google_sheet()
         if sheet:
             sheet.update_cell(assignment["row"], 7, phone)
-            await m.reply(f"Номер <b>{phone}</b> записан. Удачной смены!", parse_mode=ParseMode.HTML)
-            # Удаляем привязку — номер записан
-            del anketa_assignments[tg_id]
+            await m.reply(f"Номер <b>{phone}</b> записан. Удачной смены!\n\nМожешь обновить номер — просто отправь новый.", parse_mode=ParseMode.HTML)
+            # Привязка остаётся — оператор может обновить номер в течение дня
         else:
             await m.reply("Ошибка подключения к таблице. Отправь номер ещё раз.")
     except Exception as e:
